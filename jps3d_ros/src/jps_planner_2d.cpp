@@ -474,7 +474,7 @@ bool JpsPlanner2D::plan_path(vec_Vec2f &path, const Vec2f &start,
 
   // Set up DMP planner
   DMPlanner2D dmp(false);
-  dmp.setPotentialRadius(Vec2f(1.0, 1.0)); // Set 2D potential field radius
+  dmp.setPotentialRadius(Vec2f(0.5, 0.5)); // Set 2D potential field radius
   dmp.setSearchRadius(
       Vec2f(0.5, 0.5));         // Set the valid search region around given path
   dmp.setMap(map_util_, start); // Set map util for collision checking, must be
