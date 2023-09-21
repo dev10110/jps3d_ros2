@@ -1,8 +1,8 @@
 #pragma once
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <vector>
-
 
 enum InterpolationMode
 {
@@ -93,4 +93,17 @@ bool interpolate(std::vector<T, A> &res, const std::vector<double> t, const std:
 		  return false;
 	  }
   }
+}
+
+double fmod_floor(double a, double n) {
+  return std::fmod(std::fmod(a, n) + n, n);
+}
+
+double wrap(double x) { return fmod_floor(x + M_PI, 2 * M_PI) - M_PI; }
+
+double interpolate_angles(double b, double a, double f) {
+  // returns a + f * (b - a) but wrapped correctly
+  // asssumes radians
+  //
+  return wrap(a + wrap(b - a) * f);
 }

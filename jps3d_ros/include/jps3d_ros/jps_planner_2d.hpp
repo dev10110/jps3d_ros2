@@ -41,6 +41,16 @@
 
 using namespace JPS; // from the jps3d library
 
+template <class T1, class T2> struct VirtualObstacle {
+  T1 x;
+  T2 y;
+  rclcpp::Time t; // time of insertion since start of node
+
+  bool operator==(const VirtualObstacle<T1, T2> &o) const {
+    return ((this->x == o.x) && (this->y == o.y) && (this->t == o.t));
+  }
+};
+
 // define the hash function for the std::pair
 struct pair_hash
 {
@@ -55,6 +65,15 @@ struct pair_hash
 
 };
 
+struct vobs_hash {
+
+  template <class T1, class T2>
+  std::size_t operator()(VirtualObstacle<T1, T2> const &vobs) const {
+    std::size_t h1 = std::hash<T1>()(vobs.x);
+    std::size_t h2 = std::hash<T2>()(vobs.y);
+    return h1 ^ h2;
+  }
+};
 
 class JpsPlanner2D : public rclcpp::Node {
 
@@ -71,6 +90,8 @@ private:
   double quad_radius_ = 0.2; // meters
   double desired_speed_ = 1.0; // m/s
   double resample_rate_hz_= 2.0; //hz
+  double smoothing_param_ = 0.2; // \in [0, 1]
+  double dmp_potential_radius_ = 0.15; // meters
 
   // VARS
   std::shared_ptr<OccMapUtil> map_util_;
@@ -78,7 +99,11 @@ private:
   geometry_msgs::msg::PoseStamped goal_pose_;
   rclcpp::TimerBase::SharedPtr timer_;
   double map_z_ = 0.0;
-  std::unordered_set<std::pair<double, double>, pair_hash> virtual_obstacles_;
+  // std::unordered_set<std::pair<double, double>, pair_hash>
+  // virtual_obstacles_;
+  std::unordered_set<VirtualObstacle<double, double>, vobs_hash>
+      virtual_obstacles_;
+  double start_yaw_ = 0.0;
 
   bool goal_updated_ = false;
   bool map_updated_ = false;
@@ -99,6 +124,7 @@ private:
 
   // PUBS
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_jps_;
   rclcpp::Publisher<dasc_msgs::msg::DITrajectory>::SharedPtr pub_traj_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_traj_viz_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_occ_grid_;
@@ -118,6 +144,8 @@ private:
   std::vector<double> get_yaws(const vec_Vec2f & path);
 
   bool resample_path(vec_Vec2f & resampled_path, std::vector<double> & resampled_yaws, const vec_Vec2f & path, double dt);
+  void smoothen_path(vec_Vec2f &path, std::vector<double> &yaws,
+                     double initial_yaw);
 
   Vec2f project_to_map(Vec2f &goal);
   bool plan_path(vec_Vec2f &path, const Vec2f &start, const Vec2f &goal);

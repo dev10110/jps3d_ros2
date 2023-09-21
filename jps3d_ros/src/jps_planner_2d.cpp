@@ -27,12 +27,17 @@ JpsPlanner2D::JpsPlanner2D() : Node("jps_planner_2d") {
   quad_radius_ = this->declare_parameter<double>("quad_radius_m", quad_radius_);
   desired_speed_ = this->declare_parameter<double>("desired_speed_m_per_s", desired_speed_);
   resample_rate_hz_ = this->declare_parameter<double>("resample_rate_hz", resample_rate_hz_);
+  smoothing_param_ =
+      this->declare_parameter<double>("smoothing_param", smoothing_param_);
+  dmp_potential_radius_ = this->declare_parameter<double>(
+      "dmp_potential_radius_m", dmp_potential_radius_);
 
   // VARS
   map_util_ = std::make_shared<OccMapUtil>(); // specifically for 2D
 
   // PUBS
   pub_path_ = this->create_publisher<Path>("/path", 10);
+  pub_path_jps_ = this->create_publisher<Path>("/path_jps", 10);
   pub_traj_ =
       this->create_publisher<DITrajectory>("/nominal_traj", 10);
   pub_traj_viz_ = 
@@ -63,12 +68,14 @@ JpsPlanner2D::JpsPlanner2D() : Node("jps_planner_2d") {
   sub_map_ = this->create_subscription<DistanceMapSlice>(
       "/nvblox_node/map_slice", 10,
       std::bind(&JpsPlanner2D::callback_map, this, _1));
-  sub_virtual_obs_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-      "virtual_obstacles", 100, 
-      std::bind(&JpsPlanner2D::callback_virtual_obstacles, this, _1));
-  sub_chebyshev_center_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-		  "/nvblox_node/sfc/chebyshev_center", 10,
-		  std::bind(&JpsPlanner2D::callback_chebyshev_center, this, _1));
+  sub_virtual_obs_ =
+      this->create_subscription<geometry_msgs::msg::PointStamped>(
+          "virtual_obstacles", 100,
+          std::bind(&JpsPlanner2D::callback_virtual_obstacles, this, _1));
+  sub_chebyshev_center_ =
+      this->create_subscription<geometry_msgs::msg::PointStamped>(
+          "/nvblox_node/sfc/chebyshev_center", 10,
+          std::bind(&JpsPlanner2D::callback_chebyshev_center, this, _1));
 
   // Timer
   timer_ = this->create_wall_timer(
@@ -106,13 +113,16 @@ void JpsPlanner2D::callback_virtual_obstacles(const geometry_msgs::msg::PointSta
   Vec2i obs_i = map_util_->floatToInt(obs);
   
   // convert back to a obs point
-  constexpr int D = 4;
+  constexpr int D = 1;
   for (int i=-D; i <= D; i++) {
 	  for (int j=-D; j<=D; j++) {
-		  Vec2f obs_f = map_util_->intToFloat(obs_i + Vec2i(i,j)); 
-		  // add it to the set
-		  virtual_obstacles_.insert(std::make_pair(obs_f(0), obs_f(1)));
-	  }
+		  Vec2f obs_f = map_util_->intToFloat(obs_i + Vec2i(i,j));
+                  // add it to the set
+                  // virtual_obstacles_.insert(
+                  //		  std::make_pair(obs_f(0), obs_f(1)));
+                  virtual_obstacles_.insert(
+                      {obs_f(0), obs_f(1), get_clock()->now()});
+          }
   }
 
 
@@ -139,6 +149,7 @@ bool JpsPlanner2D::update_start_state() {
   start_pose_.pose.position.y = t.transform.translation.y;
   start_pose_.pose.position.z = t.transform.translation.z;
   start_pose_.pose.orientation = t.transform.rotation;
+  start_yaw_ = tf2::getYaw(start_pose_.pose.orientation);
 
   return true;
 }
@@ -183,13 +194,16 @@ void JpsPlanner2D::callback_timer() {
   if (! map_util_ -> isFree(start_idx) ) 
   {
 
-	  // publish straight line path to the chebyshev center
+    // RCLCPP_WARN(get_logger(), "start is not free!!");
+    // return;
 
-	  Vec2f chebyshev_goal = {chebyshev_x_, chebyshev_y_};
-	  goal(0) = chebyshev_goal(0);
-	  goal(1) = chebyshev_goal(1); // modify the goal
-	  path.push_back(start);
-	  path.push_back(chebyshev_goal);
+    // publish straight line path to the chebyshev center
+
+    Vec2f chebyshev_goal = {chebyshev_x_, chebyshev_y_};
+    goal(0) = chebyshev_goal(0);
+    goal(1) = chebyshev_goal(1); // modify the goal
+    path.push_back(start);
+    path.push_back(chebyshev_goal);
 
   }
   else {
@@ -208,8 +222,8 @@ void JpsPlanner2D::callback_timer() {
   }
   // add the true goal location
   path.push_back(goal);
-  } 
-  
+  }
+
   RCLCPP_INFO(get_logger(), mytimer.log("path planned").c_str()); 
 
 
@@ -227,6 +241,10 @@ void JpsPlanner2D::callback_timer() {
   resampled_path.push_back(goal);
   resampled_yaws.push_back(resampled_yaws.back());
 
+  // smoothen the path
+  // smoothen_path(resampled_path, resampled_yaws, resampled_yaws[0]);
+  smoothen_path(resampled_path, resampled_yaws, start_yaw_);
+
   //// skip the first few
   //for (int i =0; i < 4; i++){
   //resampled_path.erase(resampled_path.begin());
@@ -234,8 +252,8 @@ void JpsPlanner2D::callback_timer() {
   //}
 
   // RCLCPP_INFO(get_logger(), mytimer.log("resampled path").c_str());
- 
-  // publish_path(path);
+
+  publish_path(path);
   publish_traj(resampled_path, resampled_yaws, dt);
 
   write_map(start, goal, path);
@@ -248,6 +266,21 @@ void JpsPlanner2D::callback_timer() {
   timer_msg.nanosec = static_cast<uint32_t>(mytimer.elapsed_ns());
   pub_timer_dmp_->publish(timer_msg);
   
+}
+
+void JpsPlanner2D::smoothen_path(vec_Vec2f &path, std::vector<double> &yaws,
+                                 double initial_yaw) {
+
+  double f = smoothing_param_;
+  for (std::size_t i = 0; i < yaws.size(); i++) {
+
+    if (i == 0) {
+      yaws[0] = interpolate_angles(yaws[0], initial_yaw, f);
+
+    } else {
+      yaws[i] = interpolate_angles(yaws[i], yaws[i - 1], f);
+    }
+  }
 }
 
 void JpsPlanner2D::publish_path(const vec_Vec2f & path) {
@@ -292,8 +325,7 @@ void JpsPlanner2D::publish_path(const vec_Vec2f & path) {
   }
 
   // publish the path msg
-  pub_path_->publish(path_msg);
-
+  pub_path_jps_->publish(path_msg);
 }
 
 void JpsPlanner2D::publish_traj(const vec_Vec2f & path, const std::vector<double> & yaws, double dt)
@@ -355,11 +387,12 @@ void JpsPlanner2D::publish_traj(const vec_Vec2f & path, const std::vector<double
 
 }
 
-bool JpsPlanner2D::resample_path(vec_Vec2f & resampled_path, std::vector<double> & resampled_yaws, const vec_Vec2f & path, double dt){ 
-	// first assign the timepoints to each element of path
+bool JpsPlanner2D::resample_path(vec_Vec2f & resampled_path, std::vector<double> & resampled_yaws, const vec_Vec2f & path, double dt){
+
+        // first assign the timepoints to each element of path
 	std::vector<double> ts = allocate_times(path);
 
-	// fill the sample times vector
+        // fill the sample times vector
 	std::size_t N = (ts.back() / dt); // total number of samples
 	std::vector<double> sample_ts(N, 0);
 	for (std::size_t i=0; i < N; ++i)
@@ -376,10 +409,10 @@ bool JpsPlanner2D::resample_path(vec_Vec2f & resampled_path, std::vector<double>
 	}
 	
 	
-	// determine yaws 
-  resampled_yaws = get_yaws(resampled_path);
+	// determine yaws
+        resampled_yaws = get_yaws(resampled_path);
 
-	return true;
+        return true;
 
 }
 
@@ -387,7 +420,6 @@ std::vector<double> JpsPlanner2D::allocate_times(const vec_Vec2f & path)
 {
 
 	const double v = desired_speed_;
-
 
 	std::vector<double> ts(path.size(), 0.0);
 	
@@ -411,11 +443,13 @@ std::vector<double> JpsPlanner2D::get_yaws(const vec_Vec2f & path)
 
 	double sq_goal_radius = goal_radius_ * goal_radius_;
 
-	std::vector<double> yaws(path.size(), goal_yaw);
+        // fill the yaws with the goal yaw
+        std::vector<double> yaws(path.size(), goal_yaw);
 
 	const Vec2f goal = path.back();
 
-	for (std::size_t i=0; i < path.size() - 1; ++i)
+        // if the point is far from the goal, specify a new yaw
+        for (std::size_t i=0; i < path.size() - 1; ++i)
 	{
 
 		if ( (path[i] - goal).squaredNorm() > sq_goal_radius) {
@@ -474,7 +508,9 @@ bool JpsPlanner2D::plan_path(vec_Vec2f &path, const Vec2f &start,
 
   // Set up DMP planner
   DMPlanner2D dmp(false);
-  dmp.setPotentialRadius(Vec2f(0.5, 0.5)); // Set 2D potential field radius
+  dmp.setPotentialRadius(
+      Vec2f(dmp_potential_radius_,
+            dmp_potential_radius_)); // Set 2D potential field radius
   dmp.setSearchRadius(
       Vec2f(0.5, 0.5));         // Set the valid search region around given path
   dmp.setMap(map_util_, start); // Set map util for collision checking, must be
@@ -553,9 +589,17 @@ void JpsPlanner2D::callback_map(const DistanceMapSlice &msg) {
   map_util_->setMap(origin, dim, data, res);
 
   // add in the virtual obstacles
-  for (auto const & pair : virtual_obstacles_) {
-   
-    Vec2f p = {pair.first, pair.second};
+  for (auto &vobs : virtual_obstacles_) {
+
+    // // check if i should delete the element
+    // if ((get_clock()->now() - vobs.t).seconds() > 10.0)
+    // {
+    //         virtual_obstacles_.erase(vobs);
+    //         continue;
+    // }
+
+    // Vec2f p = {pair.first, pair.second};
+    Vec2f p = {vobs.x, vobs.y};
 
     // convert to index based on map
     Vec2i pi = map_util_-> floatToInt(p);
@@ -569,9 +613,7 @@ void JpsPlanner2D::callback_map(const DistanceMapSlice &msg) {
     else {
       RCLCPP_DEBUG(get_logger(), "virtual obs (%f, %f) is out of  map bounds", p(0), p(1));
     }
-
   }
-  
 
   map_util_->setMap(origin, dim, data, res);
 
