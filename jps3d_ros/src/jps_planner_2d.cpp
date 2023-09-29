@@ -562,9 +562,9 @@ void JpsPlanner2D::callback_map(const DistanceMapSlice &msg) {
   }
 
   // load the data in
-  Vec2f origin = {msg.origin.x, msg.origin.y};
-  Vec2i dim = {msg.width, msg.height};
   double res = msg.resolution;
+  Vec2f origin = {msg.origin.x - res/2, msg.origin.y - res/2};
+  Vec2i dim = {msg.width, msg.height};
 
   const bool mark_unknown_as_free = true;
 
